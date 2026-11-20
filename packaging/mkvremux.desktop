@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=mkvremux
+Comment=An opinionated MKV remuxer to work beside NextPVR and an HDHomeRun
+Exec=mkvremux
+Icon=mkvremux
+# Terminal=true matches the reference packaging (isopress.desktop):
+# mkvremux is a CLI tool, so launching it from a menu must open a
+# terminal rather than pretend to be a GUI app.
+Terminal=true
+# Categories: AudioVideo is a registered main category (freedesktop
+# menu spec) and reflects what the tool does with video files; no
+# trailing period on Comment= per the freedesktop desktop-entry spec.
+Categories=AudioVideo;
+StartupNotify=false

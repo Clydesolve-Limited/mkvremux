@@ -1,0 +1,28 @@
+# golangci-lint v2 configuration (R2-8 lint hygiene).
+#
+# Deliberately MINIMAL: ONE exclusion, and nothing else. Every default
+# linter (errcheck, govet, ineffassign, staticcheck, unused) stays fully
+# enabled for PRODUCTION code - no check that can catch a real bug in
+# shipped code is disabled or weakened here, and no production path is
+# exempted. No package-path or module-name entries: this module is
+# `makeMKV`, package `main`, so there is nothing to scope.
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # The ONLY rule: errcheck in _test.go files.
+      #
+      # Rationale: the test-only errcheck class is fixture/teardown
+      # noise, not a signal - deferred Close on a handle the test
+      # opened (t.TempDir files, exec pipes), best-effort cleanup
+      # chmods and removes, and helper writes whose error the test
+      # asserts on immediately afterwards. A close failure inside a
+      # t.TempDir() fixture cannot mislead an assertion (the operation
+      # under test fails on its own), and hand-annotating every site
+      # would add `//nolint` clutter without adding coverage. The same
+      # class in production code was fixed site by site with an inline
+      # rationale on every ignored error.
+      - path: '_test\.go'
+        linters:
+          - errcheck

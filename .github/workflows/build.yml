@@ -1,0 +1,184 @@
+# mkvremux CI: test, lint and package the repository.
+#
+# TWO CI SURFACES, ONE WORKFLOW (confirmed stakeholder topology):
+#   (1) INTERNAL - the internal Gitea instance with its own Actions
+#       runner executes this exact file on the FULL repo (internal
+#       working docs included) for every push and tag;
+#   (2) EXTERNAL - scripts/publish.sh pushes sanitized single-commit
+#       snapshots to the public GitHub repository, which runs the same
+#       file for distribution.
+# Exactly one step is GitHub-specific: the release at the bottom runs
+# `gh` only when github.server_url is https://github.com, so a tag cut
+# on the INTERNAL server (scripts/release.sh tags internally first and
+# mirrors to GitHub through publish.sh) skips it instead of failing
+# against api.github.com and painting an otherwise-green internal run
+# red.
+#
+# ASCII only (house rule). First-party actions only: actions/checkout,
+# actions/setup-go, actions/upload-artifact - releases go through the
+# preinstalled gh CLI, never a third-party release action.
+#
+# All four Makefile gates run here; this project has no race/e2e/perf
+# build-tag tiers (single-tier by design). Hermetic gates, NO ffmpeg
+# installed: the suite must pass with an empty PATH (Gate A recorded
+# 41 tests green that way) and the single optional real-tool test
+# skips when ffmpeg/ffprobe are absent. ffmpeg is reported
+# preinstalled on GitHub-hosted runner images per runner-images -
+# UNVERIFIED here - and UNUSED by the current gates: if an
+# ffmpeg-dependent test is ever added, install ffmpeg explicitly in
+# the system-packages step (or verify it first) instead of relying on
+# the image.
+#
+# Artifacts: dist/mkvremux_<version>_amd64.deb and
+# dist/mkvremux-<version>-amd64.AppImage, uploaded on every run and
+# attached to a GitHub Release when the push is a v* tag.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # contents: write is needed ONLY by the tag-run release step
+    # (gh release create); it is scoped to this single job.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Toolchain selection - do NOT "simplify" this step.
+      # CI installs go 1.26.1 DIRECTLY (explicit `go-version`, the
+      # GO-2026-4601 fix) instead of resolving `go-version-file: go.mod`,
+      # whose `go 1.24` directive predates the fix. go.mod's
+      # `toolchain go1.26.1` line still governs LOCAL builds through Go's
+      # own GOTOOLCHAIN=auto default; dropping that line locally, or
+      # pinning CI below 1.26.1, would re-open the vulnerability. The
+      # `make vulncheck` gate below runs on every build and remains the
+      # backstop if the toolchain pin ever regresses.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+
+      # desktop-file-utils: package-appimage.sh runs
+      # desktop-file-validate on packaging/mkvremux.desktop.
+      # librsvg2-bin: rsvg-convert renders packaging/icon.svg to the
+      # AppImage's PNG icon.
+      # ffmpeg is DELIBERATELY not installed - see the header's
+      # hermetic-gates note. dpkg-deb, curl and timeout ship with the
+      # ubuntu-latest image (ASSUMPTION; unverified until the first
+      # run of this workflow).
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils librsvg2-bin
+
+      # The Makefile resolves these three from `go env GOPATH`/bin, not
+      # from PATH, so `go install` into that directory is exactly what
+      # `make lint` and `make vulncheck` expect.
+      - name: Install Go gate tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: make verify
+        run: make verify
+
+      - name: make lint
+        run: make lint
+
+      - name: make vulncheck
+        run: make vulncheck
+
+      - name: make test
+        run: make test
+
+      - name: Package .deb
+        run: scripts/package-deb.sh
+
+      - name: Package .AppImage
+        run: scripts/package-appimage.sh
+
+      # NOTE: two explicit patterns instead of dist/*.{deb,AppImage} -
+      # actions/upload-artifact matches through @actions/glob, which
+      # runs minimatch with nobrace: true, so brace expansion would
+      # silently match NOTHING.
+      #
+      # Left UNGUARDED on the internal surface ON PURPOSE: this
+      # workflow has never run anywhere yet, so its Gitea
+      # compatibility is an ASSUMPTION, not a verified fact (the first
+      # internal Gitea run at Gate B is its first real test). If an
+      # internal run ever fails HERE, apply the same github.server_url
+      # guard as the release step below.
+      #
+      # Pinned to @v4 deliberately: upload-artifact@v6+ is
+      # incompatible with Gitea Actions (gitea #36829), and the same
+      # workflow runs on both surfaces (GitHub distributes via
+      # publish.sh) - do not bump without re-checking the Gitea side.
+      # Plan B for GHES refusal: the
+      # christopherhx/gitea-upload-artifact@v4 mirror (the
+      # GHES-assert-stripped fork).
+      - name: Upload artifacts
+        id: upload-artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkvremux-artifacts
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+
+      # Runs ONLY when the upload step itself failed (the id makes the
+      # condition precise: a failure in any earlier gate must not fire
+      # it) and prints the runbook inline so whoever reads the failed
+      # run sees the known fixes without leaving the page. Plain
+      # echoes (no ::group:: folding - not verified to render on
+      # Gitea) and every probe guarded with `|| true` so diagnostics
+      # can never fail the run.
+      - name: Artifact upload diagnostics
+        if: failure() && steps.upload-artifacts.outcome == 'failure'
+        run: |
+          echo '=== artifact upload diagnostics (upload step failed) ==='
+          echo '--- URLs the action tried ---'
+          env | grep -E '^ACTIONS_(RESULTS|RUNTIME)' | sort || true
+          echo '--- connectivity probe (10s timeout, never fails this step) ---'
+          if [ -n "${ACTIONS_RESULTS_URL:-}" ]; then
+            curl -sS -o /dev/null -w 'results-url: %{http_code} %{errormsg}\n' --max-time 10 "${ACTIONS_RESULTS_URL%/}" || true
+          else
+            echo 'ACTIONS_RESULTS_URL: not set'
+          fi
+          if [ -n "${ACTIONS_RUNTIME_URL:-}" ]; then
+            curl -sS -o /dev/null -w 'runtime-url: %{http_code} %{errormsg}\n' --max-time 10 "${ACTIONS_RUNTIME_URL%/}" || true
+          else
+            echo 'ACTIONS_RUNTIME_URL: not set'
+          fi
+          echo '--- known fixes (runbook) ---'
+          echo '1) ROOT_URL not reachable by the runner (ECONNREFUSED):'
+          echo '   set PUBLIC_URL_DETECTION = auto in the [server] section'
+          echo '   of Gitea app.ini, restart Gitea, re-run this job.'
+          echo '2) GHESNotSupportedError: switch the upload step to the'
+          echo '   christopherhx/gitea-upload-artifact@v4 mirror'
+          echo '   (the GHES-assert-stripped mirror; plan B noted in the'
+          echo '   pin comment above).'
+          echo '=== end diagnostics ==='
+
+      - name: Create GitHub release (tags only)
+        # GitHub-only step. github.server_url discriminates both ways:
+        # GitHub sets it to https://github.com (contexts reference,
+        # "The URL of the GitHub server"), a Gitea Actions runner sets
+        # it to the Gitea instance base URL (Gitea docs, server_url =
+        # "The URL of the Gitea instance"), so an internal tag push
+        # skips this step instead of running `gh` against
+        # api.github.com and failing.
+        if: startsWith(github.ref, 'refs/tags/') && github.server_url == 'https://github.com'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/*.AppImage \
+            --title "mkvremux $GITHUB_REF_NAME" --generate-notes
