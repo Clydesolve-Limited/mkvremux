@@ -12,7 +12,8 @@
 # PATH by default. Same resolution as the reference, so the targets
 # work unchanged in a fresh shell.
 GOPATH_BIN := $(shell go env GOPATH)/bin
-
+GITHUB_URL=https://github.com/Clydesolve-Limited/mkvremux
+export GITHUB_URL
 # Single source of truth for VERSION (git describe; falls back to
 # "dev"). Used only by `ver` and the docker image tags below. The
 # binary's own --version is single-sourced from const toolVersion in
